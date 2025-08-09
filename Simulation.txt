@@ -1,0 +1,508 @@
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import networkx as nx
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+from sqlalchemy import create_engine
+from datetime import datetime
+import json
+import pickle
+import warnings
+warnings.filterwarnings('ignore')
+
+class ComplexSystemModel:
+    def __init__(self, domain: str, db_config: dict = None):
+        """
+        Инициализация комплексной модели
+        
+        Параметры:
+        - domain: 'ecology'|'economy'|'sociodynamics'
+        - db_config: конфигурация подключения к БД
+        """
+        self.domain = domain
+        self.db_engine = create_engine(db_config['uri']) if db_config else None
+        self.ml_models = {}
+        self.scalers = {}
+        self.components = {}
+        self.relations = []
+        self.stabilizers = {}
+        self.history = []
+        self.physical_constraints = {}
+        self._init_domain_config(domain)
+        self._load_initial_data()
+        
+    def _init_domain_config(self, domain):
+        """ Предустановки для предметных областей """
+        configs = {
+            'ecology': {
+                'components': {
+                    'BIO_DIVERSITY': 85, 
+                    'POLLUTION': 35,
+                    'RESOURCES': 70,
+                    'CLIMATE': 45
+                },
+                'relations': [
+                    ('BIO_DIVERSITY_new', '0.8*BIO_DIVERSITY - 0.3*POLLUTION + 0.1*RESOURCES + ML_BIO_DIVERSITY'),
+                    ('POLLUTION_new', 'POLLUTION + 0.5*INDUSTRY - 0.2*CLEAN_TECH'),
+                    ('RESOURCES_new', 'RESOURCES - 0.1*CONSUMPTION + 0.05*RECYCLING'),
+                    ('CLIMATE_new', 'CLIMATE + 0.2*EMISSIONS - 0.1*FOREST_COVER')
+                ],
+                'stabilizers': {
+                    'min_val': 0,
+                    'max_val': 100,
+                    'decay_rate': 0.05
+                },
+                'physical_constraints': {
+                    'BIO_DIVERSITY': {'min': 0, 'max': 100, 'type': 'percentage'},
+                    'POLLUTION': {'min': 0, 'max': None, 'type': 'concentration'}
+                }
+            },
+            'economy': {
+                'components': {
+                    'GDP': 1000,
+                    'INFLATION': 5.0,
+                    'UNEMPLOYMENT': 7.0,
+                    'INTEREST_RATE': 3.0
+                },
+                'relations': [
+                    ('GDP_new', 'GDP * (1 + (0.01*INNOVATION - 0.02*INTEREST_RATE)) + ML_GDP'),
+                    ('INFLATION_new', 'INFLATION + 0.5*(DEMAND - SUPPLY)/SUPPLY + ML_INFLATION'),
+                    ('UNEMPLOYMENT_new', 'UNEMPLOYMENT - 0.3*GDP_GROWTH + 0.2*AUTOMATION'),
+                    ('INTEREST_RATE_new', 'INTEREST_RATE + 0.5*INFLATION - 0.3*UNEMPLOYMENT')
+                ],
+                'stabilizers': {
+                    'min_val': -1e6,
+                    'max_val': 1e6,
+                    'decay_rate': 0.1
+                }
+            },
+            'sociodynamics': {
+                'components': {
+                    'SOCIAL_COHESION': 65,
+                    'CRIME_RATE': 25,
+                    'EDUCATION': 75,
+                    'HEALTHCARE': 70
+                },
+                'relations': [
+                    ('SOCIAL_COHESION_new', 'SOCIAL_COHESION + 0.2*EDUCATION - 0.3*CRIME_RATE + ML_SOCIAL'),
+                    ('CRIME_RATE_new', 'CRIME_RATE + 0.5*UNEMPLOYMENT - 0.2*POLICING'),
+                    ('EDUCATION_new', 'EDUCATION + 0.1*FUNDING - 0.05*BRAIN_DRAIN'),
+                    ('HEALTHCARE_new', 'HEALTHCARE + 0.15*INVESTMENT - 0.1*AGING_POPULATION')
+                ],
+                'stabilizers': {
+                    'min_val': 0,
+                    'max_val': 100,
+                    'decay_rate': 0.07
+                }
+            }
+        }
+        
+        config = configs.get(domain, configs['ecology'])
+        self.components = config['components']
+        self.relations = config['relations']
+        self.stabilizers = config['stabilizers']
+        self.physical_constraints = config.get('physical_constraints', {})
+        
+        # Инициализация ML моделей для каждого компонента
+        for comp in self.components:
+            self._init_ml_model(comp)
+            
+        self.history = [{
+            'timestamp': datetime.now(),
+            **self.components.copy()
+        }]
+        
+    def _init_ml_model(self, component):
+        """ Инициализация ML модели для компонента """
+        if component.startswith('ML_'):
+            return
+            
+        # Выбор модели в зависимости от типа данных
+        if self.physical_constraints.get(component, {}).get('type') == 'percentage':
+            self.ml_models[component] = MLPRegressor(hidden_layer_sizes=(50,), max_iter=1000)
+        else:
+            self.ml_models[component] = RandomForestRegressor(n_estimators=100)
+            
+        self.scalers[component] = StandardScaler()
+        
+    def _load_initial_data(self):
+        """ Загрузка исторических данных из БД """
+        if not self.db_engine:
+            return
+            
+        try:
+            query = f"""
+                SELECT * FROM {self.domain}_history 
+                ORDER BY timestamp DESC 
+                LIMIT 1000
+            """
+            df = pd.read_sql(query, self.db_engine)
+            
+            if not df.empty:
+                # Обучение ML моделей на исторических данных
+                for comp in self.components:
+                    if comp in df.columns:
+                        X = df.drop(columns=[comp]).values
+                        y = df[comp].values
+                        
+                        if len(X) > 10:
+                            X_scaled = self.scalers[comp].fit_transform(X)
+                            self.ml_models[comp].fit(X_scaled, y)
+                            
+                # Установка последних значений
+                last_row = df.iloc[-1].to_dict()
+                for comp in self.components:
+                    if comp in last_row:
+                        self.components[comp] = last_row[comp]
+                        
+        except Exception as e:
+            print(f"Ошибка загрузки данных: {str(e)}")
+            
+    def _get_ml_prediction(self, component):
+        """ Получение прогноза от ML модели """
+        if component not in self.ml_models or component.startswith('ML_'):
+            return 0
+            
+        try:
+            # Подготовка данных для прогноза
+            input_data = pd.DataFrame([self.components])
+            X = input_data.drop(columns=[component]).values
+            X_scaled = self.scalers[component].transform(X)
+            
+            # Прогнозирование
+            prediction = self.ml_models[component].predict(X_scaled)[0]
+            
+            # Применение физических ограничений
+            constraints = self.physical_constraints.get(component, {})
+            if 'max' in constraints and prediction > constraints['max']:
+                prediction = constraints['max']
+            if 'min' in constraints and prediction < constraints['min']:
+                prediction = constraints['min']
+                
+            return prediction
+            
+        except Exception as e:
+            print(f"ML prediction error for {component}: {str(e)}")
+            return 0
+            
+    def evaluate_expression(self, expr):
+        """ Безопасное вычисление выражений с ML компонентами """
+        try:
+            # Замена ML компонентов
+            for comp in self.components:
+                if f'ML_{comp}' in expr:
+                    ml_value = self._get_ml_prediction(comp)
+                    expr = expr.replace(f'ML_{comp}', str(ml_value))
+            
+            # Вычисление математического выражения
+            return eval(expr, {'__builtins__': None}, self.components)
+        except Exception as e:
+            print(f"Ошибка вычисления выражения '{expr}': {str(e)}")
+            return 0
+            
+    def apply_physical_constraints(self, component, value):
+        """ Применение физических ограничений """
+        constraints = self.physical_constraints.get(component, {})
+        
+        if 'max' in constraints and value > constraints['max']:
+            return constraints['max']
+        if 'min' in constraints and value < constraints['min']:
+            return constraints['min']
+            
+        return value
+        
+    def stabilize_value(self, component, value):
+        """ Стабилизация значения с учетом домена """
+        # Физические ограничения
+        value = self.apply_physical_constraints(component, value)
+        
+        # Общие стабилизаторы
+        min_val = self.stabilizers.get('min_val', -1e6)
+        max_val = self.stabilizers.get('max_val', 1e6)
+        decay_rate = self.stabilizers.get('decay_rate', 0.05)
+        
+        if value < min_val:
+            return min_val + decay_rate * abs(value - min_val)
+        if value > max_val:
+            return max_val - decay_rate * abs(value - max_val)
+            
+        return value
+        
+    def evolve(self, steps: int, external_factors: dict = None):
+        """ Эволюция системы на заданное число шагов """
+        for _ in range(steps):
+            new_components = {}
+            
+            # Применение внешних факторов
+            if external_factors:
+                for factor, value in external_factors.items():
+                    if factor in self.components:
+                        self.components[factor] = value
+            
+            # Вычисление новых значений
+            for target, expr in self.relations:
+                base_target = target.replace('_new', '')
+                new_value = self.evaluate_expression(expr)
+                stabilized_value = self.stabilize_value(base_target, new_value)
+                new_components[base_target] = stabilized_value
+                
+            # Обновление системы
+            for comp in new_components:
+                self.components[comp] = new_components[comp]
+                
+            # Сохранение истории
+            self.history.append({
+                'timestamp': datetime.now(),
+                **self.components.copy()
+            })
+            
+            # Автосохранение в БД каждые 10 шагов
+            if len(self.history) % 10 == 0 and self.db_engine:
+                self._save_to_db()
+                
+        return self.history
+        
+    def _save_to_db(self):
+        """ Сохранение данных в БД """
+        try:
+            df = pd.DataFrame(self.history[-10:])
+            df.to_sql(f'{self.domain}_history', self.db_engine, 
+                     if_exists='append', index=False)
+        except Exception as e:
+            print(f"Ошибка сохранения в БД: {str(e)}")
+            
+    def get_current_state(self):
+        """ Получение текущего состояния системы """
+        return self.components.copy()
+        
+    def add_new_component(self, name: str, initial_value: float, 
+                         constraints: dict = None, ml_model=None):
+        """ Добавление нового компонента в систему """
+        self.components[name] = initial_value
+        if constraints:
+            self.physical_constraints[name] = constraints
+            
+        if ml_model:
+            self.ml_models[name] = ml_model
+        else:
+            self._init_ml_model(name)
+            
+    def add_new_relation(self, target: str, expression: str):
+        """ Добавление новой взаимосвязи """
+        self.relations.append((f"{target}_new", expression))
+        
+    def train_ml_models(self, X: pd.DataFrame, y: pd.Series, component: str):
+        """ Обучение ML модели для конкретного компонента """
+        if component not in self.components:
+            raise ValueError(f"Компонент {component} не существует")
+            
+        X_scaled = self.scalers[component].fit_transform(X)
+        self.ml_models[component].fit(X_scaled, y)
+        
+    def visualize_dynamics(self, components: list = None, figsize=(12, 8)):
+        """ Визуализация динамики системы """
+        if not components:
+            components = list(self.components.keys())
+            
+        df = pd.DataFrame(self.history).set_index('timestamp')
+        
+        plt.figure(figsize=figsize)
+        for comp in components:
+            if comp in df.columns:
+                plt.plot(df.index, df[comp], label=comp)
+                
+        plt.title(f'Динамика системы: {self.domain}')
+        plt.xlabel('Время')
+        plt.ylabel('Значение')
+        plt.legend()
+        plt.grid()
+        plt.show()
+        
+    def visualize_topology(self):
+        """ Визуализация топологии системы """
+        G = nx.DiGraph()
+        
+        # Добавление узлов
+        for component in self.components:
+            G.add_node(component, value=self.components[component])
+            
+        # Добавление связей
+        for target, expr in self.relations:
+            base_target = target.replace('_new', '')
+            variables = [word for word in expr.split() 
+                        if word in self.components and word != base_target]
+            
+            for src in variables:
+                G.add_edge(src, base_target, formula=expr)
+                
+        # Визуализация
+        pos = nx.spring_layout(G)
+        plt.figure(figsize=(14, 10))
+        
+        node_values = [G.nodes[n]['value'] for n in G.nodes]
+        nx.draw_networkx_nodes(G, pos, node_size=2000, 
+                             node_color=node_values, cmap='viridis')
+        nx.draw_networkx_edges(G, pos, edge_color='gray', width=1.5)
+        nx.draw_networkx_labels(G, pos, font_size=10)
+        
+        edge_labels = {(u, v): G[u][v]['formula'][:20] + '...' 
+                      for u, v in G.edges}
+        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+        
+        plt.title(f"Топология системы: {self.domain}")
+        plt.colorbar(plt.cm.ScalarMappable(cmap='viridis'), 
+                    label='Значение компонента')
+        plt.show()
+        
+    def sensitivity_analysis(self, component: str, delta: float = 0.1):
+        """ Анализ чувствительности системы """
+        base_state = self.components.copy()
+        results = {}
+        
+        # Сохраняем текущее значение
+        original_value = base_state[component]
+        
+        # Вариация параметра
+        self.components[component] = original_value * (1 + delta)
+        self.evolve(5)  # Короткая эволюция
+        
+        # Замер изменений
+        for comp in self.components:
+            if comp != component:
+                change = (self.components[comp] - base_state[comp]) / base_state[comp]
+                results[comp] = change * 100  # В процентах
+                
+        # Восстановление состояния
+        self.components = base_state.copy()
+        
+        # Визуализация
+        plt.figure(figsize=(10, 6))
+        plt.bar(results.keys(), results.values())
+        plt.axhline(0, color='gray', linestyle='--')
+        plt.title(f"Чувствительность к изменению {component} (+{delta*100}%)")
+        plt.ylabel("Изменение (%)")
+        plt.xticks(rotation=45)
+        plt.grid(axis='y')
+        plt.show()
+        
+        return results
+        
+    def save_model(self, filepath: str):
+        """ Сохранение модели в файл """
+        model_data = {
+            'domain': self.domain,
+            'components': self.components,
+            'relations': self.relations,
+            'stabilizers': self.stabilizers,
+            'physical_constraints': self.physical_constraints,
+            'history': self.history
+        }
+        
+        # Сохранение ML моделей отдельно
+        ml_models_data = {}
+        for name, model in self.ml_models.items():
+            ml_models_data[name] = pickle.dumps(model)
+            
+        model_data['ml_models'] = ml_models_data
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_data, f)
+            
+    @classmethod
+    def load_model(cls, filepath: str, db_config: dict = None):
+        """ Загрузка модели из файла """
+        with open(filepath, 'rb') as f:
+            model_data = pickle.load(f)
+            
+        model = cls(model_data['domain'], db_config)
+        model.components = model_data['components']
+        model.relations = model_data['relations']
+        model.stabilizers = model_data['stabilizers']
+        model.physical_constraints = model_data['physical_constraints']
+        model.history = model_data['history']
+        
+        # Восстановление ML моделей
+        for name, model_bytes in model_data['ml_models'].items():
+            model.ml_models[name] = pickle.loads(model_bytes)
+            
+        return model
+Примеры использования модели
+1. Экологическая система с интеграцией датчиков
+python
+# Конфигурация БД
+db_config = {
+    'uri': 'postgresql://user:password@localhost/ecological_db'
+}
+
+# Создание модели
+eco_model = ComplexSystemModel('ecology', db_config)
+
+# Добавление новых компонентов (например, данных с IoT датчиков)
+eco_model.add_new_component('AIR_QUALITY', 75, {'min': 0, 'max': 100})
+eco_model.add_new_component('WATER_PURITY', 85, {'min': 0, 'max': 100})
+
+# Добавление новых связей
+eco_model.add_new_relation('POLLUTION', '0.7*POLLUTION + 0.3*(100 - AIR_QUALITY)')
+eco_model.add_new_relation('BIO_DIVERSITY', 'BIO_DIVERSITY + 0.1*WATER_PURITY - 0.05*POLLUTION')
+
+# Обучение ML модели на исторических данных
+from sklearn.ensemble import GradientBoostingRegressor
+ml_model = GradientBoostingRegressor()
+eco_model.train_ml_models(X_train, y_train, 'BIO_DIVERSITY')
+
+# Эволюция системы
+history = eco_model.evolve(100, external_factors={'INDUSTRY': 45})
+
+# Визуализация
+eco_model.visualize_dynamics(['BIO_DIVERSITY', 'POLLUTION', 'AIR_QUALITY'])
+eco_model.visualize_topology()
+2. Экономическая модель с прогнозированием
+python
+# Создание экономической модели
+econ_model = ComplexSystemModel('economy')
+
+# Добавление финансовых индикаторов
+econ_model.add_new_component('STOCK_MARKET', 4500, {'min': 0})
+econ_model.add_new_component('OIL_PRICE', 75.0, {'min': 0})
+
+# Добавление связей с финансовыми рынками
+econ_model.add_new_relation('GDP', 'GDP + 0.01*STOCK_MARKET + ML_GDP')
+econ_model.add_new_relation('INFLATION', 'INFLATION + 0.005*OIL_PRICE + ML_INFLATION')
+
+# Эволюция с учетом кризиса
+history = econ_model.evolve(50, external_factors={
+    'STOCK_MARKET': 3800,
+    'OIL_PRICE': 95.0
+})
+
+# Анализ чувствительности
+econ_model.sensitivity_analysis('INTEREST_RATE', 0.2)
+
+# Сохранение модели
+econ_model.save_model('economic_model.pkl')
+3. Социодинамическая модель с интеграцией опросов
+python
+# Создание модели социодинамики
+socio_model = ComplexSystemModel('sociodynamics')
+
+# Добавление социальных факторов
+socio_model.add_new_component('POLITICAL_STABILITY', 60, {'min': 0, 'max': 100})
+socio_model.add_new_component('MEDIA_INFLUENCE', 55, {'min': 0, 'max': 100})
+
+# Добавление связей
+socio_model.add_new_relation('SOCIAL_COHESION', 
+    '0.8*SOCIAL_COHESION + 0.1*POLITICAL_STABILITY + 0.05*MEDIA_INFLUENCE')
+socio_model.add_new_relation('CRIME_RATE', 
+    'CRIME_RATE - 0.2*POLITICAL_STABILITY + 0.1*(100 - SOCIAL_COHESION)')
+
+# Эволюция с учетом политического кризиса
+history = socio_model.evolve(30, external_factors={
+    'POLITICAL_STABILITY': 30,
+    'MEDIA_INFLUENCE': 70
+})
+
+# Визуализация
+socio_model.visualize_dynamics()
